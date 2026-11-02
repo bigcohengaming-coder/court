@@ -51,6 +51,18 @@ setInterval(prune, 3600 * 1000).unref();
 
 // voice participants live only in memory: code -> Map(uid -> socket id)
 const voiceRooms = new Map();
+// relayed audio: code -> Map(listener uid -> Set(speaker uids it can't reach directly))
+const relayNeeds = new Map();
+// Tell each speaker how many listeners need its audio through the server, so it only sends when needed.
+function pushRelayTargets(code) {
+  const room = voiceRooms.get(code); if (!room) return;
+  const needs = relayNeeds.get(code) || new Map();
+  for (const [u, sid] of room) {
+    let count = 0;
+    for (const [listener, from] of needs) if (listener !== u && from.has(u)) count++;
+    io.to(sid).emit("relay:targets", { count });
+  }
+}
 
 // ---------- helpers ----------
 const uidFor = key => createHash("sha256").update(String(key)).digest("hex").slice(0, 16);
@@ -428,11 +440,37 @@ io.on("connection", socket => {
     if (target) io.to(target).emit("rtc:signal", { from: uid, data: p.data });
   });
 
+  // Server audio relay, for pairs whose direct connection is blocked by their networks.
+  // A listener says which speakers it can't reach directly; those speakers' audio is forwarded to it.
+  socket.on("relay:need", p => {
+    const code = socket.data.voice; if (!code) return;
+    const room = voiceRooms.get(code); if (!room) return;
+    const uids = Array.isArray(p?.uids) ? p.uids.filter(u => typeof u === "string" && room.has(u) && u !== uid).slice(0, 50) : [];
+    let needs = relayNeeds.get(code);
+    if (!needs) relayNeeds.set(code, needs = new Map());
+    if (uids.length) needs.set(uid, new Set(uids)); else needs.delete(uid);
+    pushRelayTargets(code);
+  });
+  socket.on("a", buf => {
+    const code = socket.data.voice; if (!code) return;
+    if (!Buffer.isBuffer(buf) || buf.length > 4096) return;
+    const c = cases.get(code), room = voiceRooms.get(code), needs = relayNeeds.get(code);
+    if (!c || !room || !needs || room.get(uid) !== socket.id || !canSpeak(c, uid)) return;
+    for (const [listener, from] of needs) {
+      if (!from.has(uid)) continue;
+      const sid = room.get(listener);
+      if (sid) io.to(sid).volatile.emit("a", uid, buf);
+    }
+  });
+
   function leaveVoice(code) {
     const room = voiceRooms.get(code);
     if (!room || room.get(uid) !== socket.id) return;
     room.delete(uid);
-    if (!room.size) voiceRooms.delete(code);
+    const needs = relayNeeds.get(code);
+    if (needs) { needs.delete(uid); for (const s of needs.values()) s.delete(uid); }
+    pushRelayTargets(code);
+    if (!room.size) { voiceRooms.delete(code); relayNeeds.delete(code); }
     if (socket.data.voice === code) socket.data.voice = null;
     io.to("case:" + code).emit("voice:peer-left", { uid });
     const c = cases.get(code); if (c) changed(c);

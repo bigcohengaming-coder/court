@@ -47,4 +47,10 @@ Set these under your service's **Environment** tab in Render.
 
 ## How voice works
 
-Everyone in voice connects directly to everyone else (WebRTC). The server only passes along connection details and decides who may speak, so it uses very little bandwidth. This works well for a courtroom of up to about 10 people talking and listening at once. Bigger rooms would need a media server such as LiveKit.
+Everyone in voice first tries to connect directly to everyone else (WebRTC). The server only passes along connection details and decides who may speak.
+
+Some networks (mobile data, many home routers, office Wi-Fi) block direct connections. When two people can't connect directly within about 7 seconds, their audio automatically goes through the Petty Court server instead, at phone-call quality. No extra accounts are needed. The voice bar shows "through the server" when this happens. On the relay, headphones help avoid echo. Only people the judge allows to speak are forwarded; the server drops everyone else's audio.
+
+Adding a TURN relay (see Optional settings) lets more people connect directly, which gives slightly better quality and uses less of your server's bandwidth. It's optional.
+
+This works well for a courtroom of up to about 10 people in voice. Bigger rooms would need a media server such as LiveKit.
