@@ -103,6 +103,7 @@ function applyState(v) {
   remember(S.caseId, S.kase.title);
   renderCaseFrame(); renderCasePanels(); renderDock();
   voice.sync();
+  maybeOfferInvite();
 }
 
 // ---------- local actions for the practice hearing; server calls otherwise ----------
@@ -125,8 +126,21 @@ const api = {
     return emit("phase:set", { code: S.caseId, dir });
   },
   gavel() {
-    if (S.demo) { S.msgs.push({ id: "g" + Math.random(), kind: "gavel", text: "Order! Order in the court!", nick: me().nick, role: "judge", at: Date.now() }); gavelFx(); return refreshDemo(); }
+    if (S.demo) {
+      S.msgs.push({ id: "g" + Math.random(), kind: "gavel", text: "Order! Order in the court!", nick: me().nick, role: "judge", at: Date.now() });
+      S.msgs.push({ id: "s" + Math.random(), kind: "system", text: "The judge silenced the courtroom. Only the judge can speak.", at: Date.now() });
+      S.voiceState.muted = Object.fromEntries(S.members.filter(m => m.id !== S.uid).map(m => [m.id, true]));
+      gavelFx(); return refreshDemo();
+    }
     return emit("gavel", { code: S.caseId });
+  },
+  unmuteAll() {
+    if (S.demo) {
+      S.voiceState.muted = {};
+      S.msgs.push({ id: "s" + Math.random(), kind: "system", text: "The judge unmuted the courtroom.", at: Date.now() });
+      return refreshDemo();
+    }
+    return emit("voice:unmute-all", { code: S.caseId });
   },
   addEvidence(e) {
     if (S.demo) {
@@ -182,6 +196,50 @@ function remember(code, title) {
   const list = ls.get("mine", []).filter(x => x.code !== code);
   list.unshift({ code, title, at: Date.now() }); ls.set("mine", list.slice(0, 20));
 }
+function canOrganize() { return !S.demo && (isCreator() || canPreside()); }
+function fmtWhen(ts, tz) {
+  return new Date(ts).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit", ...(tz ? { timeZoneName: "short" } : {}) });
+}
+function untilText(ts) {
+  const m = Math.round((ts - Date.now()) / 60000);
+  if (m > 0) {
+    const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+    return "in " + (d ? `${d} day${d > 1 ? "s" : ""}${h ? ` ${h} h` : ""}` : h ? `${h} h${mm ? ` ${mm} min` : ""}` : `${mm} min`);
+  }
+  return m > -2 ? "starting now" : `started ${-m < 60 ? -m + " min" : Math.round(-m / 60) + " h"} ago`;
+}
+// "2026-11-08T20:00" in the viewer's own time zone, for <input type="datetime-local">
+function toLocalInput(ts) {
+  const d = new Date(ts), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function caseLink(invite) { return `${location.origin}/#${S.caseId}${invite ? `.${invite.role}.${invite.token}` : ""}`; }
+function parseHash() {
+  const m = /^([A-Za-z0-9]{6})(?:\.(petitioner|defendant|judge|jury|gallery)\.([a-f0-9]{16}))?$/.exec(location.hash.slice(1));
+  return m ? { code: m[1].toUpperCase(), invite: m[2] ? { role: m[2], token: m[3] } : null } : null;
+}
+function calendarLinks(k) {
+  const start = new Date(k.scheduledAt), end = new Date(k.scheduledAt + 3600e3);
+  const z = d => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const title = `Petty Court: ${k.title}`, details = `Join the hearing: ${caseLink()}`;
+  const google = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(title)}&dates=${z(start)}/${z(end)}&details=${encodeURIComponent(details)}`;
+  const icsEsc = s => s.replace(/[\\;,]/g, m => "\\" + m).replace(/\n/g, "\\n");
+  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Petty Court//EN", "BEGIN:VEVENT",
+    `UID:${S.caseId}-${k.scheduledAt}@pettycourt`, `DTSTAMP:${z(new Date())}`, `DTSTART:${z(start)}`, `DTEND:${z(end)}`,
+    `SUMMARY:${icsEsc(title)}`, `DESCRIPTION:${icsEsc(details)}`, `URL:${caseLink()}`, "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+  return { google, ics };
+}
+// While the page is open, announce the hearing when its time arrives.
+setInterval(() => {
+  const k = S.kase;
+  if (S.view !== "case" || S.demo || !k?.scheduledAt) return;
+  const el = $("#sched-when"); if (el) el.textContent = untilText(k.scheduledAt);
+  if (Date.now() >= k.scheduledAt && Date.now() - k.scheduledAt < 5 * 60e3 && S.alertedFor !== k.scheduledAt) {
+    S.alertedFor = k.scheduledAt;
+    gavelFx();
+    toast(voice.joined ? "The hearing is starting now." : "The hearing is starting now. Join voice at the bottom of the screen.");
+  }
+}, 15000);
 function gavelFx() {
   window.courtKnock(voice.audioCtx());
   document.querySelectorAll(".msg.gavel").forEach(el => { el.classList.remove("gavelhit"); void el.offsetWidth; el.classList.add("gavelhit"); });
@@ -269,7 +327,7 @@ function caseCard(c) {
   const juryLeft = Math.max(0, (c.juryMax || 0) - (s.jury || 0));
   const st = c.status === "verdict" ? `<span class="pill done">Verdict in</span>` : c.status === "assembling" ? `<span class="pill">Assembling</span>` : `<span class="pill live">${esc((PHASES[PHASE_IDX[c.status]] || [])[1] || "Live")}</span>`;
   return `<article class="case-card">
-    <div class="row"><span class="mono muted" style="font-size:12px">#${esc(c.id)}</span><span class="eyebrow">${esc(c.category)}</span>${st}${c.live ? `<span class="pill voice">${c.live} in voice</span>` : ""}</div>
+    <div class="row"><span class="mono muted" style="font-size:12px">#${esc(c.id)}</span><span class="eyebrow">${esc(c.category)}</span>${st}${c.live ? `<span class="pill voice">${c.live} in voice</span>` : ""}${c.scheduledAt && c.scheduledAt > Date.now() - 3600e3 && c.status !== "verdict" ? `<span class="pill">Hearing ${esc(fmtWhen(c.scheduledAt))}</span>` : ""}</div>
     <div class="t">${esc(c.title)}</div>
     <div class="row">${open.map(r => `<span class="pill open">${ROLES[r].label} open</span>`).join("")}${c.aiJudge ? `<span class="pill">AI judge</span>` : ""}<span class="pill">${juryLeft} jury seat${juryLeft === 1 ? "" : "s"} open</span></div>
     <div><button class="btn small" type="button" data-open="${esc(c.id)}">${c.status === "verdict" ? "Read the verdict" : "Enter courtroom"}</button></div>
@@ -320,10 +378,11 @@ function bindFile() {
 }
 
 // ---------- case room ----------
-async function openCase(code, { keepTab } = {}) {
+async function openCase(code, { keepTab, invite } = {}) {
   code = String(code).toUpperCase();
   if (S.demo || S.caseId !== code) voice.leave();
   Object.assign(S, { view: "case", demo: false, uid: S.realUid, caseId: code, pendingImg: null, caseMissing: false });
+  if (!keepTab) S.invite = invite || null;
   if (!keepTab) Object.assign(S, { kase: null, members: [], msgs: [], evidence: [], marks: [], votes: [], voiceState: { muted: {}, floor: {}, hands: {}, participants: [] }, tab: "hearing" });
   try { history.replaceState(null, "", "#" + code); } catch {}
   if (!keepTab) render();
@@ -362,12 +421,23 @@ function renderCaseFrame() {
       <div class="muted" style="font-size:13.5px;margin-top:4px">Filed by ${esc(k.creatorNick || "someone")} ${k.createdAt ? ago(k.createdAt) : ""}</div>
     </div>
     <div style="display:grid;gap:8px;justify-items:end">
-      <div class="codebox"><span class="eyebrow">Room code</span><span class="code">${esc(S.caseId)}</span>${S.demo ? "" : `<button class="btn small" id="copy" type="button">Copy invite link</button>`}</div>
+      <div class="codebox"><span class="eyebrow">Room code</span><span class="code">${esc(S.caseId)}</span>${S.demo ? "" : `<button class="btn small" id="copy" type="button">Copy invite link</button>`}${canOrganize() && !settled && k.status !== "verdict" ? `<button class="btn small brass" id="plan" type="button">Schedule &amp; invite</button>` : ""}</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:end">${presideControls()}</div>
     </div>
   </div>
   ${settled ? `<div class="banner">Settled out of court. The parties made peace. The record stays open to read.</div>` :
-  `<div class="phases" aria-label="Hearing phase">${PHASES.map(([, lab], i) => `<div class="phase ${i === pi ? "cur" : i < pi ? "past" : ""}"><span class="n">${i + 1}</span>${lab}</div>`).join("")}</div>`}`;
+  `<div class="phases" aria-label="Hearing phase">${PHASES.map(([, lab], i) => `<div class="phase ${i === pi ? "cur" : i < pi ? "past" : ""}"><span class="n">${i + 1}</span>${lab}</div>`).join("")}</div>`}
+  ${k.scheduledAt && !settled && k.status !== "verdict" && !S.demo ? `<div class="sched">
+    <div class="when"><span class="eyebrow">Hearing scheduled</span><b>${esc(fmtWhen(k.scheduledAt, true))}</b><span class="muted" id="sched-when">${esc(untilText(k.scheduledAt))}</span></div>
+    <div class="acts"><a class="btn small" href="${esc(calendarLinks(k).google)}" target="_blank" rel="noopener">Google Calendar</a><button class="btn small" type="button" id="ics">Download calendar file</button></div>
+  </div>` : ""}`;
+  const plan = $("#plan"); if (plan) plan.onclick = planBox;
+  const icsBtn = $("#ics");
+  if (icsBtn) icsBtn.onclick = () => {
+    const url = URL.createObjectURL(new Blob([calendarLinks(k).ics], { type: "text/calendar" }));
+    const a = Object.assign(document.createElement("a"), { href: url, download: `petty-court-${S.caseId}.ics` });
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+  };
   const cp = $("#copy");
   if (cp) cp.onclick = async () => {
     const link = `${location.origin}/#${S.caseId}`;
@@ -387,7 +457,8 @@ function presideControls() {
   if (pi < PHASES.length - 2) out.push(`<button class="btn primary small" type="button" data-act="next">Move to ${PHASES[pi + 1][1].toLowerCase()}</button>`);
   if (pi === PHASES.length - 2) out.push(`<button class="btn primary small" type="button" data-act="next">Go to verdict</button>`);
   if (pi > 0 && !(pi === PHASES.length - 1 && S.kase.verdict)) out.push(`<button class="btn small" type="button" data-act="back">Back a phase</button>`);
-  if (pi < PHASES.length - 1) out.push(`<button class="btn brass small" type="button" data-act="gavel">Order! Order!</button>`);
+  if (pi < PHASES.length - 1) out.push(`<button class="btn brass small" type="button" data-act="gavel" title="Bang the gavel and mute everyone except you">Order! Order!</button>`);
+  if (Object.keys(S.voiceState.muted || {}).length) out.push(`<button class="btn small" type="button" data-act="unmute-all">Unmute everyone</button>`);
   return out.join("") + settle;
 }
 function presideAct(a) {
@@ -398,6 +469,7 @@ function presideAct(a) {
     quiet(api.phase("next"));
   } else if (a === "back") quiet(api.phase("back"));
   else if (a === "gavel") quiet(api.gavel());
+  else if (a === "unmute-all") quiet(api.unmuteAll());
 }
 
 // ---------- bench / seats ----------
@@ -773,6 +845,116 @@ function renderDock() {
   const l = $("#v-leave"); if (l) l.onclick = () => voice.leave();
 }
 
+// ---------- schedule & invite ----------
+function planBox() {
+  const k = S.kase, L = $("#layer");
+  const roles = ["defendant", "petitioner", "judge", "jury", "gallery"].filter(r =>
+    (r !== "judge" || !k.aiJudge) && (r !== "jury" || k.juryMax) && (!SPEAKING.includes(r) || !seated(r)));
+  const first = roles[0];
+  L.innerHTML = `<div class="modal-bg"><div class="modal plan" role="dialog" aria-label="Schedule and invite">
+    <div style="display:flex;justify-content:space-between;align-items:start;gap:10px"><div><div class="eyebrow">Case #${esc(S.caseId)}</div><h3 style="margin-top:4px">Schedule &amp; invite</h3></div><button class="btn ghost small" type="button" id="pl-x">Close</button></div>
+    <form class="form" id="sch-form">
+      <label for="sch-at">Hearing date and time <span class="hint">Everyone sees it in their own time zone.</span>
+        <input type="datetime-local" id="sch-at" required value="${k.scheduledAt ? toLocalInput(k.scheduledAt) : ""}" min="${toLocalInput(Date.now())}"></label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary small" type="submit">${k.scheduledAt ? "Update time" : "Schedule hearing"}</button>${k.scheduledAt ? `<button class="btn ghost small" type="button" id="sch-clear">Clear time</button>` : ""}</div>
+    </form>
+    <hr>
+    ${roles.length ? `<div class="form">
+      <div><div style="font-weight:600;font-size:14px;margin-bottom:6px">Invite someone as</div>
+        <div class="radios" id="inv-roles">${roles.map(r => `<label><input type="radio" name="inv-role" value="${r}" ${r === first ? "checked" : ""}> ${ROLES[r].label}</label>`).join("")}</div></div>
+      <label for="inv-name">Their name <span class="hint">Optional. Used in the message.</span><input type="text" id="inv-name" maxlength="24" placeholder="Kabir"></label>
+      <label for="inv-msg">Invite message<textarea id="inv-msg" rows="7" readonly>Making the invite link…</textarea></label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn primary small" type="button" id="inv-copy">Copy message</button>
+        <a class="btn small" id="inv-wa" href="#" target="_blank" rel="noopener">Send on WhatsApp</a>
+        <a class="btn small" id="inv-mail" href="#">Send by email</a>
+        ${navigator.share ? `<button class="btn small" type="button" id="inv-share">Share…</button>` : ""}
+      </div>
+      <p class="muted" style="margin:0;font-size:13px">Whoever opens this link is offered the ${"<b id=\"inv-rolename\"></b>"} seat directly${k.public ? ", without waiting for your approval" : ""}. Speaking seats go to the first person who takes them.</p>
+    </div>` : `<p class="muted">Every speaking seat is taken and there's no room left to invite into. Share the room code for people to watch.</p>`}
+  </div></div>`;
+  $("#pl-x").onclick = () => L.innerHTML = "";
+  $("#sch-form").onsubmit = async e => {
+    e.preventDefault();
+    const at = new Date($("#sch-at").value).getTime();
+    if (!at) return toast("Pick a date and time.");
+    try { await emit("case:schedule", { code: S.caseId, at }); toast("Hearing scheduled for " + fmtWhen(at)); L.innerHTML = ""; } catch {}
+  };
+  const clr = $("#sch-clear"); if (clr) clr.onclick = async () => { try { await emit("case:schedule", { code: S.caseId, at: null }); toast("Hearing time cleared"); L.innerHTML = ""; } catch {} };
+  if (!roles.length) return;
+  S.inviteTokens ||= {};
+  let current = { text: "", link: "" };
+  const build = async () => {
+    const role = document.querySelector("[name=inv-role]:checked").value;
+    $("#inv-rolename").textContent = ROLES[role].label.toLowerCase();
+    let token = S.inviteTokens[S.caseId + role];
+    if (!token) {
+      try { token = (await emit("invite:create", { code: S.caseId, role })).token; S.inviteTokens[S.caseId + role] = token; }
+      catch { $("#inv-msg").value = "Couldn't make the invite link. Check your connection and try again."; return; }
+    }
+    const name = $("#inv-name").value.trim();
+    const link = caseLink({ role, token });
+    const seat = role === "jury" ? "a seat on the jury" : role === "gallery" ? "a seat in the gallery" : `the ${ROLES[role].label.toLowerCase()}'s seat`;
+    const text = [
+      `${name ? name + ", you're" : "You're"} summoned to Petty Court!`,
+      ``,
+      `Case: "${k.title}" (#${S.caseId})`,
+      `Your seat: ${seat}`,
+      k.scheduledAt ? `Hearing: ${fmtWhen(k.scheduledAt, true)}` : `Hearing: as soon as everyone's in`,
+      ``,
+      `Take your seat here: ${link}`
+    ].join("\n");
+    current = { text, link };
+    $("#inv-msg").value = text;
+    $("#inv-wa").href = "https://wa.me/?text=" + encodeURIComponent(text);
+    $("#inv-mail").href = `mailto:?subject=${encodeURIComponent(`You're summoned to Petty Court: ${k.title}`)}&body=${encodeURIComponent(text)}`;
+  };
+  $("#inv-roles").onchange = build;
+  $("#inv-name").oninput = build;
+  $("#inv-copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(current.text); toast("Invite copied. Paste it into any chat."); }
+    catch { $("#inv-msg").select(); toast("Select the message and copy it."); }
+  };
+  const sh = $("#inv-share");
+  if (sh) sh.onclick = () => navigator.share({ title: "Petty Court summons", text: current.text }).catch(() => {});
+  build();
+}
+
+// Someone opened a role invite link: offer them that seat.
+function maybeOfferInvite() {
+  const inv = S.invite;
+  if (!inv || !S.kase || S.invite.shown) return;
+  if (me()) { S.invite = null; return; }
+  inv.shown = true;
+  const k = S.kase, L = $("#layer");
+  const taken = SPEAKING.includes(inv.role) && seated(inv.role);
+  const closed = ["verdict", "settled"].includes(k.status);
+  const seat = inv.role === "jury" ? "on the jury" : inv.role === "gallery" ? "in the gallery" : `as the ${ROLES[inv.role].label.toLowerCase()}`;
+  L.innerHTML = `<div class="modal-bg"><div class="modal" role="dialog" aria-label="Court summons">
+    <div class="eyebrow">Court summons · Case #${esc(S.caseId)}</div>
+    <h3 style="margin-block:6px 8px">You're invited to sit ${esc(seat)}</h3>
+    <p style="margin:0 0 6px"><b>${esc(k.title)}</b></p>
+    ${k.scheduledAt ? `<p class="muted" style="margin:0 0 12px">Hearing: ${esc(fmtWhen(k.scheduledAt, true))} (${esc(untilText(k.scheduledAt))})</p>` : ""}
+    ${closed ? `<p class="muted">This hearing is already over. You can still read the record.</p>` : taken ? `<p class="muted">Someone already took that seat. You can still join the jury or watch from the gallery.</p>` : ""}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+      ${!closed && !taken ? `<button class="btn primary" type="button" id="inv-take">Take the seat</button>` : ""}
+      <button class="btn ghost" type="button" id="inv-later">${!closed && !taken ? "Just look around" : "OK"}</button>
+    </div>
+  </div></div>`;
+  $("#inv-later").onclick = () => { L.innerHTML = ""; S.invite = null; };
+  const take = $("#inv-take");
+  if (take) take.onclick = () => {
+    L.innerHTML = "";
+    askNick(async n => {
+      try {
+        const r = await emit("seat:claim", { code: S.caseId, role: inv.role, nick: n, invite: inv.token });
+        S.invite = null;
+        toast(r.state === "requested" ? "Request sent. The case creator approves speaking seats." : "You're seated. Join voice at the bottom of the screen when the hearing starts.");
+      } catch {}
+    });
+  };
+}
+
 // ---------- modals ----------
 function askNick(cb) {
   const L = $("#layer");
@@ -848,13 +1030,13 @@ $("#nav-home").onclick = () => go("home");
 $("#nav-file").onclick = () => go("file");
 $("#nav-demo").onclick = startDemo;
 window.addEventListener("hashchange", () => {
-  const h = location.hash.slice(1).toUpperCase();
-  if (/^[A-Z0-9]{6}$/.test(h) && h !== S.caseId) openCase(h);
+  const h = parseHash();
+  if (h && (h.code !== S.caseId || h.invite)) openCase(h.code, { invite: h.invite });
 });
 
 // Local debugging only.
 if (["localhost", "127.0.0.1"].includes(location.hostname)) window.__court = { S, voice, emit };
 
-const start = location.hash.slice(1).toUpperCase();
-if (/^[A-Z0-9]{6}$/.test(start)) openCase(start); else render();
+const start = parseHash();
+if (start) openCase(start.code, { invite: start.invite }); else render();
 })();
