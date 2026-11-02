@@ -69,7 +69,7 @@ h3{font-size:19px;font-weight:600}
 .hero .ctas{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .joinbox{display:flex;gap:6px}
 .joinbox input{width:120px;text-transform:uppercase;font-family:var(--f-mono);letter-spacing:.15em}
-input[type=text],textarea,select{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:9px 11px;width:100%}
+input[type=text],input[type=datetime-local],textarea,select{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:9px 11px;width:100%}
 textarea{resize:vertical;min-height:70px}
 .docket-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:22px;position:relative;overflow:hidden}
 .docket-card .stamp{position:absolute;right:-14px;top:18px;transform:rotate(12deg);border:3px solid var(--oxblood);color:var(--oxblood);font-family:var(--f-mono);font-weight:600;padding:4px 14px;letter-spacing:.15em;font-size:13px;opacity:.85}
@@ -118,6 +118,12 @@ textarea{resize:vertical;min-height:70px}
 .phase .n{font-family:var(--f-mono);font-size:11px}
 .phase.cur{background:var(--ink);color:var(--bg)}
 .phase.past{color:var(--ink)}
+.sched{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;background:var(--brass-soft);border:1px solid var(--brass);border-radius:10px;padding:10px 14px;margin-block:-6px 18px}
+.sched .when{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0}
+.sched .when b{font-family:var(--f-display);font-size:18px}
+.sched .acts{display:flex;gap:6px;flex-wrap:wrap}
+.modal.plan{max-width:560px}
+.modal hr{border:0;border-top:1px solid var(--line);margin:18px 0}
 .room{display:grid;grid-template-columns:300px minmax(0,1fr);gap:18px;align-items:start}
 .bench{display:grid;gap:10px}
 .seat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px;display:grid;gap:6px;border-left:4px solid var(--c)}
