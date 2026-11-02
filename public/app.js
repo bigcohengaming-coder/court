@@ -58,6 +58,7 @@ const voice = new CourtVoice(socket, {
   onChange: () => { renderDock(); if (S.view === "case") renderBench(); },
   canSpeak: uid => canSpeakUid(uid),
   me: () => S.uid,
+  participants: () => S.voiceState.participants || [],
   toast: t => toast(t)
 });
 
@@ -752,6 +753,15 @@ function renderDock() {
     else if (allowed && voice.selfMuted) { title = "You're muted"; sub = "Unmute when it's your turn to speak."; }
     else if (allowed) { title = S.voiceState.floor?.[S.uid] ? "You have the floor" : "You're live"; sub = `${n} in voice. Everyone in voice can hear you.`; }
     else { title = "Listening"; sub = mine?.state === "seated" ? (hand ? "Hand raised. Waiting for the judge." : "Raise your hand to ask the judge for the floor.") : "Take a seat to raise your hand."; }
+    const L = voice.links(), others = L.direct + L.relay + L.connecting;
+    if (!others) sub = "Nobody else is in voice yet. Share the invite link.";
+    else {
+      const parts = [];
+      if (L.direct + L.relay) parts.push(`Connected to ${L.direct + L.relay} of ${others}`);
+      if (L.connecting) parts.push(`connecting to ${L.connecting}…`);
+      if (L.relay) parts.push(`${L.relay === L.direct + L.relay ? "all" : L.relay} through the server. Headphones stop echo`);
+      sub = (allowed && !voice.selfMuted && !mutedByJudge ? "" : sub + " ") + parts.join(" · ") + ".";
+    }
     if (allowed) acts.push(`<button class="btn ${voice.selfMuted ? "primary" : ""}" type="button" id="v-mute">${voice.selfMuted ? "Unmute" : "Mute"}</button>`);
     else if (mine?.state === "seated" && !mutedByJudge) acts.push(`<button class="btn ${hand ? "brass" : ""}" type="button" id="v-hand">${hand ? "Lower hand" : "Raise hand"}</button>`);
     acts.push(`<button class="btn ghost" type="button" id="v-leave">Leave voice</button>`);
