@@ -97,10 +97,11 @@ function summary(c) {
 function docket() {
   return [...cases.values()].filter(c => c.public && c.status !== "settled")
     .sort((a, b) => b.createdAt - a.createdAt).slice(0, 80)
-    .map(c => ({ id: c.code, title: c.title, category: c.category, status: c.status, aiJudge: c.aiJudge, juryMax: c.juryMax, createdAt: c.createdAt, summary: summary(c), live: (voiceRooms.get(c.code)?.size || 0) }));
+    .map(c => ({ id: c.code, title: c.title, category: c.category, status: c.status, aiJudge: c.aiJudge, juryMax: c.juryMax, createdAt: c.createdAt, scheduledAt: c.scheduledAt || null, summary: summary(c), live: (voiceRooms.get(c.code)?.size || 0) }));
 }
 function view(c) {
-  const { members, msgs, evidence, marks, votes, voice, ...meta } = c;
+  // inviteTokens stay on the server: they're handed out only to the creator and judge.
+  const { members, msgs, evidence, marks, votes, voice, inviteTokens, ...meta } = c;
   return {
     kase: { ...meta, summary: summary(c) },
     members: Object.entries(members).map(([id, m]) => ({ id, ...m })),
@@ -234,7 +235,9 @@ io.on("connection", socket => {
     let state = "seated";
     if (SPEAKING.includes(role)) {
       if (seatedUid(c, role)) fail("That seat is taken.");
-      if (c.public && c.createdBy !== uid) state = "requested";
+      // A role invite from the creator or judge counts as approval in advance.
+      const invited = typeof p.invite === "string" && c.inviteTokens?.[role] === p.invite;
+      if (c.public && c.createdBy !== uid && !invited) state = "requested";
     }
     if (role === "jury") {
       const jurors = Object.values(c.members).filter(m => m.role === "jury" && m.state === "seated").length;
@@ -244,6 +247,37 @@ io.on("connection", socket => {
     if (state === "seated") sysMsg(c, `${nick} takes the ${role === "jury" ? "jury box" : role === "gallery" ? "gallery" : role + "'s seat"}.`);
     changed(c);
     return { ok: true, state };
+  });
+
+  // ---------- scheduling and role invites (case creator or judge) ----------
+  const canOrganize = (c, u) => c.createdBy === u || canPreside(c, u);
+  on("case:schedule", p => {
+    const c = getCase(p.code);
+    if (!canOrganize(c, uid)) fail("Only the case creator or the judge can schedule the hearing.");
+    if (!open(c)) fail("This hearing is over.");
+    if (p.at == null) {
+      if (!c.scheduledAt) return;
+      c.scheduledAt = null;
+      sysMsg(c, "The hearing time was cleared.");
+    } else {
+      const at = Number(p.at), now = Date.now();
+      if (!Number.isFinite(at) || at < now - 3600e3 || at > now + 365 * 24 * 3600e3) fail("Pick a time within the next year.");
+      c.scheduledAt = Math.round(at / 60000) * 60000;
+      sysMsg(c, `${c.members[uid]?.nick || "The court"} scheduled the hearing.`);
+    }
+    changed(c);
+  });
+  on("invite:create", p => {
+    const c = getCase(p.code);
+    if (!canOrganize(c, uid)) fail("Only the case creator or the judge can send invites.");
+    const role = [...SPEAKING, "jury", "gallery"].includes(p.role) ? p.role : null;
+    if (!role) fail("Pick a role to invite.");
+    if (role === "judge" && c.aiJudge) fail("This case has an AI judge.");
+    if (role === "jury" && !c.juryMax) fail("This case has no jury seats.");
+    c.inviteTokens ||= {};
+    c.inviteTokens[role] ||= randomBytes(8).toString("hex");
+    save();
+    return { ok: true, token: c.inviteTokens[role] };
   });
 
   on("seat:decide", p => {
@@ -342,9 +376,21 @@ io.on("connection", socket => {
     const now = Date.now();
     if (now - (c.gavelAt || 0) < 2500) return;
     c.gavelAt = now;
+    // Order in the court: everyone except the judge is muted until the judge lets them speak again.
+    for (const u of new Set([...Object.keys(c.members), ...(voiceRooms.get(c.code)?.keys() || [])])) {
+      if (u !== uid) c.voice.muted[u] = true;
+    }
     c.msgs.push({ id: newId(), kind: "gavel", text: "Order! Order in the court!", role: c.members[uid]?.role || "judge", nick: c.members[uid]?.nick || "The court", uid, at: now });
-    trimMsgs(c);
+    sysMsg(c, "The judge silenced the courtroom. Only the judge can speak.");
     io.to("case:" + c.code).emit("gavel");
+    changed(c, { docket: false });
+  });
+  on("voice:unmute-all", p => {
+    const c = getCase(p.code);
+    if (!canPreside(c, uid)) fail("Only the judge can unmute the courtroom.");
+    if (!Object.keys(c.voice.muted).length) return;
+    c.voice.muted = {};
+    sysMsg(c, "The judge unmuted the courtroom.");
     changed(c, { docket: false });
   });
 
