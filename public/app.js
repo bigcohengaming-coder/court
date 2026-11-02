@@ -43,7 +43,11 @@ if (!/^[a-f0-9]{32}$/.test(key)) {
   key = [...b].map(x => x.toString(16).padStart(2, "0")).join(""); ls.set("key", key);
 }
 let nick = ls.get("nick", "");
-const socket = io({ auth: { key } });
+// Opening the secret admin link (/#admin.<key>) turns this browser into the site admin.
+let adminKey = ls.get("admin", "");
+const adminHash = /^#admin\.([A-Za-z0-9_-]{16,128})$/.exec(location.hash);
+if (adminHash) { adminKey = adminHash[1]; ls.set("admin", adminKey); try { history.replaceState(null, "", location.pathname); } catch {} }
+const socket = io({ auth: { key, ...(adminKey ? { admin: adminKey } : {}) } });
 
 const S = {
   view: "home", filter: "All", tab: "hearing",
@@ -70,13 +74,33 @@ socket.on("disconnect", () => { S.connected = false; setConn(); });
 socket.on("connect_error", () => { S.connected = false; setConn(); });
 socket.on("hello", h => {
   S.uid = S.realUid = h.uid; S.aiAvailable = h.aiJudge;
-  if (S.view === "file") render();
+  const wasAdmin = S.admin;
+  S.admin = !!h.admin;
+  if (h.adminRejected) {
+    ls.set("admin", ""); adminKey = ""; socket.auth = { key };
+    toast("That admin link isn't valid. Check ADMIN_KEY in your server settings.");
+  }
+  renderAdminBar();
+  if (S.view === "file" || (S.admin !== !!wasAdmin && S.view !== "case")) render();
+  else if (S.admin !== !!wasAdmin && S.kase) { renderCaseFrame(); renderCasePanels(); }
+});
+socket.on("kicked", ({ code }) => {
+  if (code !== S.caseId) return;
+  voice.leave(true);
+  toast("You were removed from this courtroom.");
+  go("home");
+});
+socket.on("case:deleted", ({ code }) => {
+  if (code !== S.caseId) return;
+  voice.leave(true);
+  toast("This courtroom was deleted.");
+  go("home");
 });
 socket.on("docket", list => { S.cases = list; S.docketLoaded = true; if (S.view === "home") renderDocket(); });
 socket.on("case:state", v => { if (!S.demo && v.kase.code === S.caseId) applyState(v); });
 socket.on("gavel", () => gavelFx());
 
-function setConn() { $("#conn").textContent = S.connected ? "" : "Reconnecting…"; }
+function setConn() { renderAdminBar(); }
 
 function emit(event, payload) {
   return new Promise((resolve, reject) => {
@@ -184,7 +208,54 @@ function me() { return S.members.find(m => m.id === S.uid); }
 function seated(role) { return S.members.find(m => m.role === role && m.state === "seated"); }
 function isCreator() { return !!S.kase && S.kase.createdBy === S.uid; }
 // Only the seated judge runs the hearing. With an AI judge, the case creator acts as court clerk.
-function canPreside() { if (!S.kase) return false; return S.kase.aiJudge ? isCreator() : seated("judge")?.id === S.uid; }
+function canPreside() { if (!S.kase) return false; if (S.admin && !S.demo) return true; return S.kase.aiJudge ? isCreator() : seated("judge")?.id === S.uid; }
+function isOwner() { return isCreator() || (S.admin && !S.demo); }
+
+// ---------- site admin ----------
+function adminTools(m) {
+  if (!S.admin || S.demo || m.id === S.uid) return "";
+  return `<button class="btn ghost small danger" type="button" data-admin="kick:${esc(m.id)}" title="Remove ${esc(m.nick)} and keep them out of this courtroom">Remove</button>`;
+}
+function adminDel(m) {
+  return S.admin && !S.demo ? ` <button class="btn ghost small danger" type="button" data-admin="delmsg:${esc(m.id)}" aria-label="Delete this message">Delete</button>` : "";
+}
+function renderAdminBar() {
+  const el = $("#conn");
+  if (!S.admin) { el.innerHTML = S.connected ? "" : "Reconnecting…"; return; }
+  el.innerHTML = `<span class="pill admin">Admin</span> <button class="btn ghost small" type="button" id="admin-exit">Exit admin</button>${S.connected ? "" : " Reconnecting…"}`;
+  $("#admin-exit").onclick = () => confirmBox("Exit admin mode?", "This browser stops being the admin. Open your admin link again to come back.", "Exit admin", () => {
+    ls.set("admin", ""); adminKey = ""; socket.auth = { key }; socket.disconnect().connect();
+  });
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-admin]");
+  if (!b || !S.admin) return;
+  const [act, id] = b.dataset.admin.split(":");
+  const code = S.caseId;
+  if (act === "kick") {
+    const m = S.members.find(x => x.id === id);
+    confirmBox(`Remove ${m?.nick || "this guest"}?`, "They're taken out of the courtroom and voice, and can't come back into this case from the same browser.", "Remove", () => quiet(emit("admin:kick", { code, uid: id })));
+  } else if (act === "delmsg") quiet(emit("admin:delete-msg", { code, id }));
+  else if (act === "delev") confirmBox("Delete this exhibit?", "The photo is deleted for everyone. This can't be undone.", "Delete exhibit", () => quiet(emit("admin:delete-evidence", { code, id })));
+  else if (act === "delcase" || act === "delcase-list") {
+    const target = act === "delcase" ? code : id;
+    confirmBox(`Delete case #${target}?`, "The whole courtroom, its record and its photos are deleted for everyone. This can't be undone.", "Delete case", async () => {
+      try { await emit("admin:delete-case", { code: target }); toast(`Case #${target} deleted`); if (S.view === "home") renderAdminCases(); } catch {}
+    });
+  }
+});
+async function renderAdminCases() {
+  const el = $("#admin-cases"); if (!el || !S.admin) return;
+  let list;
+  try { list = (await emit("admin:list", {})).cases; } catch { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="sechead"><div><div class="eyebrow">Admin · every courtroom, public and private</div><h2>All cases</h2></div><span class="muted">${list.length} case${list.length === 1 ? "" : "s"}</span></div>
+    ${list.length ? `<div class="admin-table"><table><thead><tr><th>Case</th><th>Title</th><th>Status</th><th>People</th><th>Last active</th><th></th></tr></thead><tbody>
+    ${list.map(c => `<tr><td class="mono">#${esc(c.id)}</td><td>${esc(c.title)}<div class="muted" style="font-size:12px">${c.public ? "Public" : "Private"} · by ${esc(c.creatorNick || "?")}</div></td>
+      <td>${esc((PHASES[PHASE_IDX[c.status]] || [c.status, c.status])[1])}${c.live ? ` <span class="pill voice">${c.live} in voice</span>` : ""}</td><td>${c.people}</td><td>${c.lastActive ? ago(c.lastActive) : ""}</td>
+      <td style="white-space:nowrap"><button class="btn small" type="button" data-open-admin="${esc(c.id)}">Open</button> <button class="btn ghost small danger" type="button" data-admin="delcase-list:${esc(c.id)}">Delete</button></td></tr>`).join("")}
+    </tbody></table></div>` : `<div class="empty">No cases on the server yet.</div>`}`;
+  el.querySelectorAll("[data-open-admin]").forEach(b => b.onclick = () => openCase(b.dataset.openAdmin));
+}
 function phaseIdx() { return PHASE_IDX[S.kase?.status] ?? 0; }
 function canSpeakUid(uid) {
   const m = S.members.find(x => x.id === uid);
@@ -196,7 +267,7 @@ function remember(code, title) {
   const list = ls.get("mine", []).filter(x => x.code !== code);
   list.unshift({ code, title, at: Date.now() }); ls.set("mine", list.slice(0, 20));
 }
-function canOrganize() { return !S.demo && (isCreator() || canPreside()); }
+function canOrganize() { return !S.demo && (isOwner() || canPreside()); }
 function fmtWhen(ts, tz) {
   return new Date(ts).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit", ...(tz ? { timeZoneName: "short" } : {}) });
 }
@@ -250,7 +321,7 @@ document.addEventListener("pointerdown", () => voice.audioCtx(), { once: true })
 // ---------- top-level render ----------
 function render() {
   const app = $("#app");
-  if (S.view === "home") { app.innerHTML = homeHTML(); bindHome(); renderDocket(); }
+  if (S.view === "home") { app.innerHTML = (S.admin ? `<section id="admin-cases" style="padding-top:24px"></section>` : "") + homeHTML(); bindHome(); renderDocket(); renderAdminCases(); }
   else if (S.view === "file") { app.innerHTML = fileHTML(); bindFile(); }
   else if (S.view === "case") { app.innerHTML = caseShellHTML(); bindCaseShell(); renderCaseFrame(); renderCasePanels(); }
   renderDock();
@@ -449,7 +520,7 @@ function renderCaseFrame() {
 function presideControls() {
   if (S.kase.status === "settled") return "";
   const pi = phaseIdx(), out = [];
-  const settle = pi < PHASES.length - 1 && isCreator() && !S.demo ? `<button class="btn ghost small" type="button" data-act="settle">Settle out of court</button>` : "";
+  const settle = pi < PHASES.length - 1 && isOwner() ? `<button class="btn ghost small" type="button" data-act="settle">Settle out of court</button>` : "";
   if (!canPreside()) {
     if (pi < PHASES.length - 1) out.push(`<span class="muted" style="font-size:13px;align-self:center">${seated("judge") || S.kase.aiJudge ? "Only the judge moves the hearing along." : "Waiting for a judge to take the seat."}</span>`);
     return out.join("") + settle;
@@ -459,7 +530,7 @@ function presideControls() {
   if (pi > 0 && !(pi === PHASES.length - 1 && S.kase.verdict)) out.push(`<button class="btn small" type="button" data-act="back">Back a phase</button>`);
   if (pi < PHASES.length - 1) out.push(`<button class="btn brass small" type="button" data-act="gavel" title="Bang the gavel and mute everyone except you">Order! Order!</button>`);
   if (Object.keys(S.voiceState.muted || {}).length) out.push(`<button class="btn small" type="button" data-act="unmute-all">Unmute everyone</button>`);
-  return out.join("") + settle;
+  return out.join("") + settle + (S.admin && !S.demo ? `<button class="btn ghost small danger" type="button" data-admin="delcase">Delete case</button>` : "");
 }
 function presideAct(a) {
   if (a === "settle") return confirmBox("Settle out of court?", "The hearing ends with no verdict. Everyone can still read the record.", "Settle", () => quiet(emit("settle", { code: S.caseId })));
@@ -490,7 +561,7 @@ function judgeTools(m) {
 }
 function person(m, color) {
   const inVoice = S.voiceState.participants?.includes(m.id);
-  return `<div class="person"><span class="av ${inVoice ? "invoice" : ""}" data-speaker="${esc(m.id)}" style="--c:${color}" title="${esc(m.nick)}">${esc(initials(m.nick))}</span><span class="nm">${esc(m.nick)}${m.id === S.uid ? ` <span class="muted">(you)</span>` : ""}</span>${micBadge(m)}${judgeTools(m)}</div>`;
+  return `<div class="person"><span class="av ${inVoice ? "invoice" : ""}" data-speaker="${esc(m.id)}" style="--c:${color}" title="${esc(m.nick)}">${esc(initials(m.nick))}</span><span class="nm">${esc(m.nick)}${m.id === S.uid ? ` <span class="muted">(you)</span>` : ""}</span>${micBadge(m)}${judgeTools(m)}${adminTools(m)}</div>`;
 }
 function renderBench() {
   const el = $("#bench"); if (!el) return;
@@ -505,7 +576,7 @@ function renderBench() {
       <div class="lab">${ROLES[r].label}</div>
       ${m ? person(m, ROLES[r].c) : `<div class="who"><span class="muted">Seat open</span></div>`}
       ${canAsk ? `<div><button class="btn small" type="button" data-claim="${r}">${k.public && !isCreator() ? "Request this seat" : "Take this seat"}</button></div>` : ""}
-      ${reqs.length ? `<div class="reqs">${reqs.map(q => `<div class="req"><span><b>${esc(q.nick)}</b> wants this seat</span>${isCreator() ? `<button class="btn small" type="button" data-approve="${esc(q.id)}">Approve</button><button class="btn ghost small" type="button" data-deny="${esc(q.id)}">Deny</button>` : q.id === S.uid ? `<span class="muted">Waiting for approval</span>` : ""}</div>`).join("")}</div>` : ""}
+      ${reqs.length ? `<div class="reqs">${reqs.map(q => `<div class="req"><span><b>${esc(q.nick)}</b> wants this seat</span>${adminTools(q)}${isOwner() ? `<button class="btn small" type="button" data-approve="${esc(q.id)}">Approve</button><button class="btn ghost small" type="button" data-deny="${esc(q.id)}">Deny</button>` : q.id === S.uid ? `<span class="muted">Waiting for approval</span>` : ""}</div>`).join("")}</div>` : ""}
     </div>`;
   });
   const jurors = S.members.filter(m => m.role === "jury" && m.state === "seated");
@@ -562,13 +633,13 @@ function renderCasePanels() {
 function roleOf(m) { return ROLES[m.role] || ROLES.gallery; }
 function msgHTML(m) {
   const R = roleOf(m);
-  if (m.kind === "system") return `<div class="msg system">${esc(m.text)}</div>`;
-  if (m.kind === "gavel") return `<div class="msg gavel" style="--c:var(--judge)"><div class="body">${esc(m.text)}</div><div class="meta" style="justify-content:center">${esc(m.nick)} bangs the gavel</div></div>`;
+  if (m.kind === "system") return `<div class="msg system">${esc(m.text)}${adminDel(m)}</div>`;
+  if (m.kind === "gavel") return `<div class="msg gavel" style="--c:var(--judge)"><div class="body">${esc(m.text)}</div><div class="meta" style="justify-content:center">${esc(m.nick)} bangs the gavel${adminDel(m)}</div></div>`;
   const ruling = m.ruling ? `<span class="ruling ${m.ruling}">${m.ruling === "sustained" ? "Sustained" : "Overruled"}</span>` : "";
   const canRule = m.kind === "objection" && !m.ruling && canPreside() && !["verdict", "settled"].includes(S.kase.status);
   const evRef = m.exhibit ? ` <span class="pill">re: Exhibit ${esc(m.exhibit)}</span>` : "";
   return `<div class="msg ${m.kind === "objection" ? "objection" : ""}" style="--c:${R.c}">
-    <div class="meta"><b>${esc(m.nick)}</b><span>${R.label}</span>${m.phase ? `<span>· ${esc((PHASES[PHASE_IDX[m.phase]] || [])[1] || "")}</span>` : ""}<span>· ${m.at ? ago(m.at) : ""}</span>${evRef}</div>
+    <div class="meta"><b>${esc(m.nick)}</b><span>${R.label}</span>${m.phase ? `<span>· ${esc((PHASES[PHASE_IDX[m.phase]] || [])[1] || "")}</span>` : ""}<span>· ${m.at ? ago(m.at) : ""}</span>${evRef}${adminDel(m)}</div>
     <div class="body">${m.kind === "objection" ? `Objection! ${esc(m.grounds || "")}${m.text ? ". " + esc(m.text) : ""}` : esc(m.text)}</div>
     ${ruling}${canRule ? `<div style="display:flex;gap:6px;margin-top:6px"><button class="btn small" type="button" data-rule="${esc(m.id)}:sustained">Sustain</button><button class="btn small" type="button" data-rule="${esc(m.id)}:overruled">Overrule</button></div>` : ""}
   </div>`;
@@ -642,7 +713,7 @@ function renderEvidence(panel) {
         <div class="cap">${esc(e.caption || "No caption")}</div>
         <div class="marks">
           <button class="btn small ${ct.mine === "credible" ? "brass" : ""}" type="button" ${canMark ? "" : "disabled"} data-mark="${esc(e.id)}:credible" aria-pressed="${ct.mine === "credible"}">Credible ${ct.c}</button>
-          <button class="btn small ${ct.mine === "sus" ? "brass" : ""}" type="button" ${canMark ? "" : "disabled"} data-mark="${esc(e.id)}:sus" aria-pressed="${ct.mine === "sus"}">Sus ${ct.s}</button>
+          <button class="btn small ${ct.mine === "sus" ? "brass" : ""}" type="button" ${canMark ? "" : "disabled"} data-mark="${esc(e.id)}:sus" aria-pressed="${ct.mine === "sus"}">Sus ${ct.s}</button>${S.admin && !S.demo ? `<button class="btn ghost small danger" type="button" data-admin="delev:${esc(e.id)}">Delete</button>` : ""}
         </div>
       </div></article>`;
   }).join("")}</div>` : `<div class="empty">No exhibits yet. A picture of the crime scene is worth a thousand objections.</div>`}`;
@@ -1030,12 +1101,19 @@ $("#nav-home").onclick = () => go("home");
 $("#nav-file").onclick = () => go("file");
 $("#nav-demo").onclick = startDemo;
 window.addEventListener("hashchange", () => {
+  const am = /^#admin\.([A-Za-z0-9_-]{16,128})$/.exec(location.hash);
+  if (am) {
+    adminKey = am[1]; ls.set("admin", adminKey);
+    try { history.replaceState(null, "", location.pathname); } catch {}
+    socket.auth = { key, admin: adminKey }; socket.disconnect().connect();
+    return;
+  }
   const h = parseHash();
   if (h && (h.code !== S.caseId || h.invite)) openCase(h.code, { invite: h.invite });
 });
 
 // Local debugging only.
-if (["localhost", "127.0.0.1"].includes(location.hostname)) window.__court = { S, voice, emit };
+if (["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) window.__court = { S, voice, emit };
 
 const start = parseHash();
 if (start) openCase(start.code, { invite: start.invite }); else render();
