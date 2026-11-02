@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: petty-court
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Optional: turns on the AI judge. Paste your Anthropic API key in Render's dashboard.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Optional: a TURN relay so voice works on strict networks (some mobile data, office Wi-Fi).
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false
