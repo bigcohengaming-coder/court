@@ -45,6 +45,7 @@ Set these under your service's **Environment** tab in Render.
 
 | Setting | What it does |
 |---|---|
+| `ADMIN_KEY` | Turns on your secret admin link. Use a long secret of at least 16 letters, numbers, `-` or `_`. Your admin link is `https://<your-site>/#admin.<ADMIN_KEY>`. Opening it makes that browser the site admin: it sees every case (including private ones), has all judge and creator controls in every courtroom, and can remove guests (they're kicked out of the room and voice and can't come back to that case), delete messages and exhibits, and delete whole cases. **Exit admin** in the top bar switches it off. Anyone with the link becomes admin, so don't share it, and change `ADMIN_KEY` if it leaks. |
 | `ANTHROPIC_API_KEY` | Turns on the AI judge. Create a key at https://console.anthropic.com. Each ruling costs a few cents. |
 | `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | A TURN relay for voice. Without one, voice can fail for people on some mobile networks or strict office Wi-Fi. Free relays are available from providers such as Metered (https://www.metered.ca/stun-turn). `TURN_URLS` can list several addresses separated by commas. |
 

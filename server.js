@@ -2,7 +2,7 @@
 import express from "express";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -169,17 +169,41 @@ function sysMsg(c, text) { c.msgs.push({ id: newId(), kind: "system", text, at: 
 function trimMsgs(c) { if (c.msgs.length > 600) c.msgs.splice(0, c.msgs.length - 600); }
 
 // ---------- sockets ----------
+// Site admin: whoever holds ADMIN_KEY (set in the host's environment) can run and clean up any courtroom.
+const ADMIN_KEY = process.env.ADMIN_KEY && process.env.ADMIN_KEY.length >= 16 ? process.env.ADMIN_KEY : null;
+if (process.env.ADMIN_KEY && !ADMIN_KEY) console.warn("ADMIN_KEY is shorter than 16 characters, so admin access is off.");
+function isAdminKey(k) {
+  if (!ADMIN_KEY || typeof k !== "string") return false;
+  const a = createHash("sha256").update(k).digest(), b = createHash("sha256").update(ADMIN_KEY).digest();
+  return timingSafeEqual(a, b);
+}
+
 io.use((socket, next) => {
   const key = socket.handshake.auth?.key;
   if (typeof key !== "string" || key.length < 16 || key.length > 128) return next(new Error("bad key"));
   socket.data.uid = uidFor(key);
+  socket.data.admin = isAdminKey(socket.handshake.auth?.admin);
   next();
 });
 
+// Take someone out of a case's voice room and relay bookkeeping (used when they leave or are removed).
+function dropFromVoice(code, uid) {
+  const room = voiceRooms.get(code);
+  if (!room || !room.has(uid)) return;
+  room.delete(uid);
+  const needs = relayNeeds.get(code);
+  if (needs) { needs.delete(uid); for (const s of needs.values()) s.delete(uid); }
+  pushRelayTargets(code);
+  if (!room.size) { voiceRooms.delete(code); relayNeeds.delete(code); }
+  io.to("case:" + code).emit("voice:peer-left", { uid });
+}
+
 io.on("connection", socket => {
   const uid = socket.data.uid;
+  const isAdmin = socket.data.admin;
+  const preside = c => isAdmin || canPreside(c, uid);
   socket.join("lobby");
-  socket.emit("hello", { uid, aiJudge: !!anthropic, iceServers: iceServers() });
+  socket.emit("hello", { uid, aiJudge: !!anthropic, iceServers: iceServers(), admin: isAdmin, adminRejected: !!socket.handshake.auth?.admin && !isAdmin });
   socket.emit("docket", docket());
 
   // Every handler: validate, mutate, broadcast. Errors go back through the ack.
@@ -189,7 +213,11 @@ io.on("connection", socket => {
     catch (e) { reply({ error: e.expose ? e.message : "Something went wrong on the server." }); if (!e.expose) console.error(event, e); }
   });
   const fail = msg => { const e = new Error(msg); e.expose = true; throw e; };
-  const getCase = code => cases.get(String(code || "").toUpperCase()) || fail("No courtroom with that code.");
+  const getCase = code => {
+    const c = cases.get(String(code || "").toUpperCase()) || fail("No courtroom with that code.");
+    if (c.banned?.[uid] && !isAdmin) fail("You were removed from this courtroom.");
+    return c;
+  };
   const open = c => !["verdict", "settled"].includes(c.status);
 
   on("case:create", p => {
@@ -237,7 +265,7 @@ io.on("connection", socket => {
       if (seatedUid(c, role)) fail("That seat is taken.");
       // A role invite from the creator or judge counts as approval in advance.
       const invited = typeof p.invite === "string" && c.inviteTokens?.[role] === p.invite;
-      if (c.public && c.createdBy !== uid && !invited) state = "requested";
+      if (c.public && c.createdBy !== uid && !invited && !isAdmin) state = "requested";
     }
     if (role === "jury") {
       const jurors = Object.values(c.members).filter(m => m.role === "jury" && m.state === "seated").length;
@@ -250,7 +278,7 @@ io.on("connection", socket => {
   });
 
   // ---------- scheduling and role invites (case creator or judge) ----------
-  const canOrganize = (c, u) => c.createdBy === u || canPreside(c, u);
+  const canOrganize = (c, u) => isAdmin || c.createdBy === u || canPreside(c, u);
   on("case:schedule", p => {
     const c = getCase(p.code);
     if (!canOrganize(c, uid)) fail("Only the case creator or the judge can schedule the hearing.");
@@ -282,7 +310,7 @@ io.on("connection", socket => {
 
   on("seat:decide", p => {
     const c = getCase(p.code);
-    if (c.createdBy !== uid) fail("Only the case creator approves seats.");
+    if (c.createdBy !== uid && !isAdmin) fail("Only the case creator approves seats.");
     const m = c.members[p.uid];
     if (!m || m.state !== "requested") fail("That request is gone.");
     if (p.ok) {
@@ -319,7 +347,7 @@ io.on("connection", socket => {
 
   on("msg:rule", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge rules on objections.");
+    if (!preside(c)) fail("Only the judge rules on objections.");
     const msg = c.msgs.find(x => x.id === p.id);
     if (!msg || msg.kind !== "objection" || msg.ruling) fail("Nothing to rule on.");
     msg.ruling = p.ruling === "sustained" ? "sustained" : "overruled";
@@ -360,7 +388,7 @@ io.on("connection", socket => {
 
   on("phase:set", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge moves the hearing along.");
+    if (!preside(c)) fail("Only the judge moves the hearing along.");
     if (c.status === "settled") fail("This case was settled.");
     const i = PHASES.indexOf(c.status), j = p.dir === "back" ? i - 1 : i + 1;
     if (j < 0 || j >= PHASES.length) fail("No phase that way.");
@@ -372,13 +400,13 @@ io.on("connection", socket => {
 
   on("gavel", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge holds the gavel.");
+    if (!preside(c)) fail("Only the judge holds the gavel.");
     const now = Date.now();
     if (now - (c.gavelAt || 0) < 2500) return;
     c.gavelAt = now;
     // Order in the court: everyone except the judge is muted until the judge lets them speak again.
     for (const u of new Set([...Object.keys(c.members), ...(voiceRooms.get(c.code)?.keys() || [])])) {
-      if (u !== uid) c.voice.muted[u] = true;
+      if (u !== uid && u !== seatedUid(c, "judge")) c.voice.muted[u] = true;
     }
     c.msgs.push({ id: newId(), kind: "gavel", text: "Order! Order in the court!", role: c.members[uid]?.role || "judge", nick: c.members[uid]?.nick || "The court", uid, at: now });
     sysMsg(c, "The judge silenced the courtroom. Only the judge can speak.");
@@ -387,7 +415,7 @@ io.on("connection", socket => {
   });
   on("voice:unmute-all", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge can unmute the courtroom.");
+    if (!preside(c)) fail("Only the judge can unmute the courtroom.");
     if (!Object.keys(c.voice.muted).length) return;
     c.voice.muted = {};
     sysMsg(c, "The judge unmuted the courtroom.");
@@ -396,24 +424,24 @@ io.on("connection", socket => {
 
   on("verdict:set", p => {
     const c = getCase(p.code);
-    if (c.aiJudge || seatedUid(c, "judge") !== uid) fail("Only the judge delivers the verdict.");
+    if (!isAdmin && (c.aiJudge || seatedUid(c, "judge") !== uid)) fail("Only the judge delivers the verdict.");
     if (c.status !== "verdict") fail("Move to the verdict phase first.");
     const v = p.verdict || {};
     const votes = Object.values(c.votes);
     c.verdict = {
       winner: ["petitioner", "defendant", "both", "neither"].includes(v.winner) ? v.winner : "neither",
       headline: str(v.headline, 120) || "The court has ruled", reasoning: str(v.reasoning, 1500), sentence: str(v.sentence, 200),
-      by: "judge", judgeNick: c.members[uid].nick, at: Date.now(),
+      by: "judge", judgeNick: (c.members[uid]?.nick || "Court admin"), at: Date.now(),
       jury: { p: votes.filter(x => x.side === "petitioner").length, d: votes.filter(x => x.side === "defendant").length }
     };
-    c.msgs.push({ id: newId(), kind: "gavel", text: "The court has reached a verdict.", role: "judge", nick: c.members[uid].nick, uid, at: Date.now() });
+    c.msgs.push({ id: newId(), kind: "gavel", text: "The court has reached a verdict.", role: "judge", nick: (c.members[uid]?.nick || "Court admin"), uid, at: Date.now() });
     io.to("case:" + c.code).emit("gavel");
     changed(c);
   });
 
   on("verdict:clear", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge can withdraw the ruling.");
+    if (!preside(c)) fail("Only the judge can withdraw the ruling.");
     c.verdict = null; changed(c);
   });
 
@@ -437,7 +465,7 @@ io.on("connection", socket => {
 
   on("settle", p => {
     const c = getCase(p.code);
-    if (c.createdBy !== uid) fail("Only the case creator can settle.");
+    if (c.createdBy !== uid && !isAdmin) fail("Only the case creator can settle.");
     if (!open(c)) fail("This hearing is already over.");
     c.status = "settled"; sysMsg(c, "The parties settled out of court.");
     changed(c);
@@ -446,14 +474,14 @@ io.on("connection", socket => {
   // ---------- voice ----------
   on("voice:mute", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge can mute people.");
+    if (!preside(c)) fail("Only the judge can mute people.");
     if (p.uid === uid) fail("Use your own mic button.");
     if (p.muted) c.voice.muted[p.uid] = true; else delete c.voice.muted[p.uid];
     changed(c, { docket: false });
   });
   on("voice:floor", p => {
     const c = getCase(p.code);
-    if (!canPreside(c, uid)) fail("Only the judge gives the floor.");
+    if (!preside(c)) fail("Only the judge gives the floor.");
     if (!c.members[p.uid]) fail("They're not in the courtroom.");
     if (p.on) { c.voice.floor[p.uid] = true; delete c.voice.hands[p.uid]; delete c.voice.muted[p.uid]; }
     else delete c.voice.floor[p.uid];
@@ -509,16 +537,73 @@ io.on("connection", socket => {
     }
   });
 
+  // ---------- site admin ----------
+  const adminOnly = () => { if (!isAdmin) fail("Only the site admin can do that."); };
+  on("admin:list", () => {
+    adminOnly();
+    return {
+      ok: true,
+      cases: [...cases.values()].sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0)).map(c => ({
+        id: c.code, title: c.title, category: c.category, status: c.status, public: c.public, createdAt: c.createdAt,
+        lastActive: c.lastActive, creatorNick: c.creatorNick, people: Object.keys(c.members).length, live: voiceRooms.get(c.code)?.size || 0
+      }))
+    };
+  });
+  // Remove someone from a courtroom and keep them out (bans that browser's identity from this case).
+  on("admin:kick", async p => {
+    adminOnly();
+    const c = getCase(p.code), target = String(p.uid || "");
+    if (!target || target === uid) fail("Pick someone else to remove.");
+    const m = c.members[target];
+    c.banned ||= {};
+    c.banned[target] = true;
+    delete c.members[target]; delete c.votes[target];
+    delete c.voice.floor[target]; delete c.voice.hands[target]; delete c.voice.muted[target];
+    for (const k of Object.keys(c.marks)) if (c.marks[k].uid === target) delete c.marks[k];
+    dropFromVoice(c.code, target);
+    for (const s of await io.in("case:" + c.code).fetchSockets()) {
+      if (s.data.uid !== target) continue;
+      s.emit("kicked", { code: c.code });
+      s.leave("case:" + c.code);
+      if (s.data.voice === c.code) s.data.voice = null;
+      if (s.data.code === c.code) s.data.code = null;
+    }
+    sysMsg(c, `${m?.nick || "A guest"} was removed from the courtroom.`);
+    changed(c);
+  });
+  on("admin:delete-msg", p => {
+    adminOnly();
+    const c = getCase(p.code), before = c.msgs.length;
+    c.msgs = c.msgs.filter(m => m.id !== p.id);
+    if (c.msgs.length === before) fail("That message is already gone.");
+    changed(c, { docket: false });
+  });
+  on("admin:delete-evidence", p => {
+    adminOnly();
+    const c = getCase(p.code), ev = c.evidence.find(e => e.id === p.id);
+    if (!ev) fail("That exhibit is already gone.");
+    c.evidence = c.evidence.filter(e => e.id !== p.id);
+    for (const k of Object.keys(c.marks)) if (c.marks[k].evid === p.id) delete c.marks[k];
+    fs.unlink(path.join(UPLOAD_DIR, path.basename(ev.url)), () => {});
+    sysMsg(c, `Exhibit ${ev.exhibit} was removed from evidence.`);
+    changed(c, { docket: false });
+  });
+  on("admin:delete-case", p => {
+    adminOnly();
+    const c = getCase(p.code);
+    for (const e of c.evidence) fs.unlink(path.join(UPLOAD_DIR, path.basename(e.url)), () => {});
+    io.to("case:" + c.code).emit("case:deleted", { code: c.code });
+    io.in("case:" + c.code).socketsLeave("case:" + c.code);
+    voiceRooms.delete(c.code); relayNeeds.delete(c.code);
+    cases.delete(c.code);
+    pushDocket(); save();
+  });
+
   function leaveVoice(code) {
     const room = voiceRooms.get(code);
     if (!room || room.get(uid) !== socket.id) return;
-    room.delete(uid);
-    const needs = relayNeeds.get(code);
-    if (needs) { needs.delete(uid); for (const s of needs.values()) s.delete(uid); }
-    pushRelayTargets(code);
-    if (!room.size) { voiceRooms.delete(code); relayNeeds.delete(code); }
+    dropFromVoice(code, uid);
     if (socket.data.voice === code) socket.data.voice = null;
-    io.to("case:" + code).emit("voice:peer-left", { uid });
     const c = cases.get(code); if (c) changed(c);
   }
   socket.on("disconnect", () => { if (socket.data.voice) leaveVoice(socket.data.voice); });

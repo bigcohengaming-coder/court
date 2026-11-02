@@ -9,6 +9,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
+      # Optional: a long secret (16+ letters, numbers, - or _). Your admin link is https://<your-site>/#admin.<this secret>
+      - key: ADMIN_KEY
+        sync: false
       # Optional: turns on the AI judge. Paste your Anthropic API key in Render's dashboard.
       - key: ANTHROPIC_API_KEY
         sync: false
