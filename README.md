@@ -6,6 +6,9 @@ A mock court for petty fights between friends. File a case, share the invite lin
 
 - **Live voice courtroom.** Everyone in a case can join voice. The petitioner, defendant and judge can talk. Jurors and the gallery listen, and can raise a hand to ask for the floor.
 - **The judge runs the court.** Only the judge can move the hearing to the next phase, bang the gavel (everyone hears it), mute people, and give or take back the floor. The server enforces this, not just the buttons.
+- **Order in the court.** The judge's gavel button mutes everyone except the judge, until the judge unmutes them.
+- **Scheduled hearings.** The case creator or judge sets a date and time. Everyone sees it in their own time zone, with a countdown, Google Calendar and calendar-file buttons, and an alert when it starts.
+- **Role invites.** The case creator or judge makes an invite link for a specific seat (defendant, judge, jury…) with a ready-made message to send on WhatsApp, by email or anywhere else. Whoever opens it can take that seat without waiting for approval.
 - **Photo evidence.** The parties and the judge upload screenshots and photos as Exhibit A, B, C. Anyone seated marks them "Credible" or "Sus".
 - **Objections and rulings**, a **jury vote** with a live tally, a **punishment wheel**, and a verdict certificate.
 - **AI judge (optional).** With an Anthropic API key set, a case can be judged by Claude. It reads the written record and looks at the photos. It can't hear the voice hearing.
